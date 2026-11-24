@@ -214,6 +214,78 @@ int main() {
                sent_messages[0].value("status", "") == "success",
            "device can log in again with its changed password");
 
+    // --- change_device_id ---
+    DeviceCredential second_host = db.AddDevice("", "");
+    expect(!second_host.device_id.empty(),
+           "second test host device is registered");
+    expect(!second_host.password.empty(),
+           "second test host password is registered");
+
+    sent_messages.clear();
+    negotiation.change_device_id(
+        authenticated_hdl,
+        {{"type", "change_device_id"},
+         {"request_id", "change-id-malformed"},
+         {"new_device_id", "0abc"}});
+    expect(sent_messages.size() == 1 &&
+               sent_messages[0].value("status", "") == "fail",
+           "authenticated client cannot change to a malformed device ID");
+    expect(db.VerifyDevice(offline_host.device_id, new_password) == 0,
+           "malformed ID change leaves the device ID and password unchanged");
+
+    sent_messages.clear();
+    negotiation.change_device_id(
+        authenticated_hdl,
+        {{"type", "change_device_id"},
+         {"request_id", "change-id-success"},
+         {"new_device_id", "abc123"}});
+    std::string changed_password;
+    expect(sent_messages.size() == 1 &&
+               sent_messages[0].value("type", "") == "change_device_id" &&
+               sent_messages[0].value("status", "") == "success" &&
+               sent_messages[0].value("request_id", "") ==
+                   "change-id-success" &&
+               sent_messages[0].value("user_id", "") ==
+                   offline_host.device_id &&
+               sent_messages[0].value("new_device_id", "") == "abc123" &&
+               sent_messages[0].contains("new_password"),
+           "authenticated device can change its own ID");
+    if (!sent_messages.empty() && sent_messages[0].contains("new_password"))
+      changed_password = sent_messages[0].value("new_password", "");
+    expect(!changed_password.empty() && changed_password.size() == 6,
+           "successful ID change returns a new 6-character password");
+    expect(db.VerifyDevice(offline_host.device_id, new_password) != 0,
+           "old device ID is rejected after a successful ID change");
+    expect(db.VerifyDevice("abc123", changed_password) == 0,
+           "new device ID accepts the returned password");
+
+    sent_messages.clear();
+    auto changed_id_connection = std::make_shared<int>(6);
+    websocketpp::connection_hdl changed_id_hdl(changed_id_connection);
+    negotiation.login_user(
+        changed_id_hdl,
+        {{"type", "login"},
+         {"user_id", std::string("abc123@") + changed_password}});
+    expect(sent_messages.size() == 1 &&
+               sent_messages[0].value("status", "") == "success",
+           "device can log in again with its changed ID and password");
+
+    sent_messages.clear();
+    negotiation.change_device_id(
+        changed_id_hdl,
+        {{"type", "change_device_id"},
+         {"request_id", "change-id-taken"},
+         {"new_device_id", second_host.device_id}});
+    expect(sent_messages.size() == 1 &&
+               sent_messages[0].value("status", "") == "fail" &&
+               sent_messages[0].value("reason", "") ==
+                   "Device ID is already taken",
+           "changing to an ID that is already taken fails");
+    expect(db.VerifyDevice("abc123", changed_password) == 0,
+           "failed ID change keeps the current ID and password");
+    expect(db.VerifyDevice(second_host.device_id, second_host.password) == 0,
+           "failed ID change leaves the other device untouched");
+
   }
 
   std::filesystem::remove(db_path);

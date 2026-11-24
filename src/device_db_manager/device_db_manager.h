@@ -112,6 +112,12 @@ class DeviceDBManager {
                                   const std::string& password,
                                   const DevicePasswordRecord& record,
                                   const std::string& login_public_key = "");
+  // Move a device to a user-chosen ID, keeping its login public key. The
+  // server generates a fresh connection password and returns it; nullopt on
+  // any failure. The old row is removed only after the new row is inserted,
+  // inside one transaction, so a failed change keeps the old identity.
+  std::optional<std::string> ChangeDeviceId(
+      const std::string& old_device_id, const std::string& new_device_id);
   // nullopt means unavailable/missing; an empty key is a legacy identity.
   std::optional<std::string> ReadLoginPublicKey(const std::string& device_id);
   // Call only after password verification; never replaces an existing binding.

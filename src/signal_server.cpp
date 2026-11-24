@@ -1310,6 +1310,10 @@ void SignalServer::ProcessMessage(
         signal_negotiation_->change_password(hdl, j, state->source_address,
                                              dispatch);
         break;
+      case "change_device_id"_H:
+        signal_negotiation_->change_device_id(hdl, j, state->source_address,
+                                              dispatch);
+        break;
       case "turn_credentials"_H:
         signal_negotiation_->turn_credentials(hdl, j);
         break;

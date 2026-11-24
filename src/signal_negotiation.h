@@ -67,6 +67,9 @@ class SignalNegotiation {
   bool change_password(websocketpp::connection_hdl hdl, const json& j,
                        const std::string& source_address = "",
                        const CredentialDispatch& dispatch = {});
+  bool change_device_id(websocketpp::connection_hdl hdl, const json& j,
+                        const std::string& source_address = "",
+                        const CredentialDispatch& dispatch = {});
   bool turn_credentials(websocketpp::connection_hdl hdl, const json& j);
   bool client_info(websocketpp::connection_hdl hdl, const json& j);
   bool revoke_reconnect_credential(websocketpp::connection_hdl hdl);
@@ -135,6 +138,13 @@ class SignalNegotiation {
   std::unordered_map<std::string, PasswordChangeResult>
       password_change_results_;
   std::deque<std::string> password_change_result_order_;
+  // Idempotent device-ID change replies, keyed the same way as password
+  // changes ("<device_id>\n<request_id>") and guarded by the same mutex:
+  // a device may not change its password and its ID concurrently.
+  // The stored fingerprint is the SHA-256 of the requested new device ID.
+  std::unordered_map<std::string, PasswordChangeResult>
+      device_id_change_results_;
+  std::deque<std::string> device_id_change_result_order_;
   SessionRecovery* recovery_ = nullptr;
 };
 

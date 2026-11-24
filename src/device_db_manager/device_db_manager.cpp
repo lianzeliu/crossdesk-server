@@ -776,6 +776,92 @@ DeviceCredential DeviceDBManager::RegisterDevice(
   return {};
 }
 
+std::optional<std::string> DeviceDBManager::ChangeDeviceId(
+    const std::string& old_device_id, const std::string& new_device_id) {
+  if (!ValidCustomDeviceId(new_device_id) ||
+      new_device_id == old_device_id)
+    return std::nullopt;
+  // Hash before taking the writer lock so Argon2id does not block other
+  // database work. The password is discarded if the transaction below fails.
+  const std::string new_password = DevicePassword::Generate();
+  if (new_password.empty()) return std::nullopt;
+  const auto record = DevicePassword::Hash(new_password);
+  if (!record) return std::nullopt;
+
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (!db_) return std::nullopt;
+  const auto login_public_key = ReadLoginPublicKey(old_device_id);
+  if (!login_public_key) return std::nullopt;
+  if (DeviceIdExists(new_device_id)) return std::nullopt;
+
+  if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) !=
+      SQLITE_OK)
+    return std::nullopt;
+  // Re-check inside the transaction: the new ID may have been taken, or the
+  // old one removed, after the checks above.
+  if (!ReadLoginPublicKey(old_device_id) || DeviceIdExists(new_device_id)) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return std::nullopt;
+  }
+
+  const char* insert_sql =
+      "INSERT INTO devices (device_id, password_hash, password_salt, "
+      "retention_started_at, login_public_key) VALUES "
+      "(?, ?, ?, CAST(strftime('%s','now') AS INTEGER), ?);";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    LOG_ERROR("Failed to prepare device ID change insert.");
+    return std::nullopt;
+  }
+  sqlite3_bind_text(stmt, 1, new_device_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, record->hash.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 3, record->salt.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 4, login_public_key->c_str(), -1, SQLITE_TRANSIENT);
+  const int insert_rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (insert_rc != SQLITE_DONE) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    LOG_ERROR("Failed to insert renamed device: {}", sqlite3_errmsg(db_));
+    return std::nullopt;
+  }
+
+  // The reconnect-credential trigger clears the old ID's credentials when
+  // its devices row is deleted. Presence and user/device associations for
+  // the old ID are removed here so nothing keeps pointing at it.
+  const std::pair<const char*, const char*> deletes[] = {
+      {"DELETE FROM devices WHERE device_id = ?;", old_device_id.c_str()},
+      {"DELETE FROM device_presence WHERE device_id = ?;",
+       old_device_id.c_str()},
+      {"DELETE FROM user_devices WHERE device_id = ? OR user_id = ?;",
+       old_device_id.c_str()},
+  };
+  for (const auto& [sql, id] : deletes) {
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_ERROR("Failed to prepare device ID change cleanup.");
+      return std::nullopt;
+    }
+    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
+    // The user_devices statement has two placeholders for the same ID.
+    if (sqlite3_bind_parameter_count(stmt) == 2)
+      sqlite3_bind_text(stmt, 2, id, -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_ERROR("Failed to remove renamed device: {}", sqlite3_errmsg(db_));
+      return std::nullopt;
+    }
+  }
+
+  if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return std::nullopt;
+  }
+  return new_password;
+}
+
 std::optional<DevicePasswordRecord> DeviceDBManager::ReadPassword(
     const std::string& device_id) {
   if (device_id.empty() || device_id.size() > 128 ||

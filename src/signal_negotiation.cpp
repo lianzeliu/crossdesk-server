@@ -1004,6 +1004,101 @@ bool SignalNegotiation::change_password(websocketpp::connection_hdl hdl,
   return true;
 }
 
+bool SignalNegotiation::change_device_id(websocketpp::connection_hdl hdl,
+                                          const json& j,
+                                          const std::string& source_address,
+                                          const CredentialDispatch& dispatch) {
+  json message = {{"type", "change_device_id"}, {"status", "fail"}};
+  std::string request_id;
+  if (!GetStringField(j, "request_id", request_id) || request_id.empty() ||
+      request_id.size() > 128 || request_id.find('\0') != std::string::npos) {
+    message["reason"] = "Missing or invalid request ID";
+    send_msg_(hdl, message);
+    return true;
+  }
+  message["request_id"] = request_id;
+  const std::string user_id = transmission_manager_->GetUserId(hdl);
+  message["user_id"] = user_id;
+  std::string new_device_id;
+  if (user_id.empty()) {
+    message["reason"] = "Not authenticated";
+  } else if (user_id.rfind("C-", 0) == 0 || IsTemporaryControllerId(user_id)) {
+    message["reason"] = "Device ID changes are not allowed for this identity";
+  } else if (!GetStringField(j, "new_device_id", new_device_id) ||
+             !ValidCustomDeviceId(new_device_id)) {
+    message["reason"] =
+        "Device ID must be 1-9 letters or digits, cannot start with 0, "
+        "C-, web- or cli-";
+  } else if (new_device_id == user_id) {
+    message["reason"] =
+        "New device ID must be different from the current ID";
+  } else {
+    const auto cache_key = user_id + "\n" + request_id;
+    const auto fingerprint = PasswordFingerprint(new_device_id);
+    {
+      std::lock_guard<std::mutex> lock(password_change_mutex_);
+      const auto cached = device_id_change_results_.find(cache_key);
+      if (cached != device_id_change_results_.end()) {
+        if (cached->second.password_fingerprint == fingerprint)
+          message = cached->second.response;
+        else
+          message["reason"] = "Request ID was already used";
+        send_msg_(hdl, message);
+        return true;
+      }
+    }
+    RunCredentialWork(
+        hdl, source_address, message,
+        [this, hdl, user_id, new_device_id, message, cache_key,
+         fingerprint]() -> std::function<void()> {
+          return [this, hdl, user_id, new_device_id, message = message,
+                  cache_key, fingerprint]() mutable {
+            if (hdl.expired() ||
+                transmission_manager_->GetUserId(hdl) != user_id)
+              return;
+            std::lock_guard<std::mutex> lock(password_change_mutex_);
+            const auto cached = device_id_change_results_.find(cache_key);
+            if (cached != device_id_change_results_.end()) {
+              if (cached->second.password_fingerprint == fingerprint)
+                message = cached->second.response;
+              else
+                message["reason"] = "Request ID was already used";
+            } else if (const auto new_password =
+                           device_db_manager_->ChangeDeviceId(
+                               user_id, new_device_id)) {
+              message["status"] = "success";
+              message["new_device_id"] = new_device_id;
+              message["new_password"] = *new_password;
+              device_id_change_results_.emplace(
+                  cache_key, PasswordChangeResult{fingerprint, message});
+              device_id_change_result_order_.push_back(cache_key);
+              while (device_id_change_result_order_.size() > 4096) {
+                device_id_change_results_.erase(
+                    device_id_change_result_order_.front());
+                device_id_change_result_order_.pop_front();
+              }
+              LOG_INFO(
+                  "Authenticated client [{}] changed its device ID to [{}]",
+                  user_id, new_device_id);
+            } else {
+              // The new ID is the only expected conflict; anything else is
+              // reported generically so a missing old identity is not
+              // distinguishable from a taken ID.
+              message["reason"] =
+                  device_db_manager_->ReadPassword(new_device_id)
+                      ? "Device ID is already taken"
+                      : "Failed to change device ID";
+            }
+            send_msg_(hdl, message);
+          };
+        },
+        dispatch);
+    return true;
+  }
+  send_msg_(hdl, message);
+  return true;
+}
+
 void SignalNegotiation::ForgetPasswordChangeResults(const std::string& device_id) {
   std::lock_guard<std::mutex> lock(password_change_mutex_);
   const auto prefix = device_id + "\n";
