@@ -272,6 +272,32 @@ context_ptr SignalServer::OnTlsInit(websocketpp::connection_hdl) {
 void SignalServer::ReloadTlsContext() {
   const auto cert = certs_dir_ + "/api.crossdesk.cn_bundle.crt";
   const auto key = certs_dir_ + "/api.crossdesk.cn.key";
+  // No certificate management: if either file is missing, generate a
+  // fresh self-signed pair (10 years, SAN=DNS:api.crossdesk.cn) so the
+  // server always starts. Clients for self-hosted servers skip
+  // verification, so the self-signed cert is accepted as-is. The
+  // `openssl` CLI is a runtime dependency (openssl-util).
+  if (!std::filesystem::exists(cert) || !std::filesystem::exists(key)) {
+    std::error_code ec;
+    std::filesystem::create_directories(certs_dir_, ec);
+    const std::string cmd =
+        "openssl req -x509 -newkey rsa:2048 -keyout '" + key + "' -out '" +
+        cert +
+        "' -days 3650 -nodes -subj '/CN=api.crossdesk.cn' "
+        "-addext 'subjectAltName=DNS:api.crossdesk.cn' 2>/dev/null";
+    LOG_INFO("Certificate files missing in {}; generating a self-signed pair",
+             certs_dir_);
+    if (std::system(cmd.c_str()) != 0 ||
+        !std::filesystem::exists(cert) || !std::filesystem::exists(key)) {
+      throw std::runtime_error(
+          "Failed to generate a self-signed certificate (openssl CLI required)");
+    }
+    std::filesystem::permissions(
+        key,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, ec);
+    LOG_INFO("Self-signed certificate generated in {}", certs_dir_);
+  }
   auto stamp = [](const std::string& path) {
     return std::to_string(
                std::chrono::duration_cast<std::chrono::nanoseconds>(
