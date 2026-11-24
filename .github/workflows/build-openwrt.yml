@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-openwrt:
@@ -122,3 +122,47 @@ jobs:
           name: crossdesk_server-openwrt-mediatek-filogic-arm64
           path: ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64
           compression-level: 0
+
+      # Package the binary + the admin web UI into the tarball that the
+      # lianzeliu/crossdesk-openwrt feed downloads (crossdesk-server
+      # package). Tarball contents:
+      #   crossdesk_server            (musl aarch64 binary)
+      #   admin/index.html, admin.js, admin.css, crossdesk-logo.png
+      #   LICENSE                     (needed for the feed's PKG_LICENSE_FILES)
+      - name: Package release tarball
+        shell: bash
+        run: |
+          PKG_VERSION="1.7.7"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          TARBALL="crossdesk-server-openwrt-mediatek-filogic-arm64-${PKG_VERSION}.tar.gz"
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+          rm -rf release-pkg
+          mkdir -p release-pkg/admin
+          cp ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64 release-pkg/crossdesk_server
+          cp src/admin/web/index.html src/admin/web/admin.js \
+             src/admin/web/admin.css src/admin/web/crossdesk-logo.png \
+             release-pkg/admin/
+          cp LICENSE release-pkg/
+          tar -czf "${TARBALL}" -C release-pkg crossdesk_server admin LICENSE
+          ls -lh "${TARBALL}"
+          tar -tzf "${TARBALL}"
+          sha256sum "${TARBALL}"
+
+      # Publish a versioned release for the OpenWrt feed. The tag
+      # embeds the short commit SHA on purpose: a rolling tag would
+      # change the tarball under the same URL and invalidate the
+      # feed's PKG_HASH on every rebuild. After this runs, update
+      # PKG_RELEASE_TAG and PKG_HASH in lianzeliu/crossdesk-openwrt.
+      - name: Publish release for OpenWrt feed
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openwrt-1.7.7-${{ env.SHORT_SHA }}
+          name: CrossDesk Server for OpenWrt 1.7.7 (${{ env.SHORT_SHA }})
+          body: |
+            Prebuilt musl aarch64 binary for ImmortalWrt (mediatek/filogic) + admin web UI.
+            Built from the custom-id branch (change_device_id custom-ID support).
+            Consumed by the lianzeliu/crossdesk-openwrt feed; update PKG_RELEASE_TAG and PKG_HASH there per release.
+          files: ${{ env.TARBALL }}
+          draft: false
+          prerelease: false
