@@ -1,0 +1,124 @@
+# Build CrossDesk Server for the OpenWrt router (musl, aarch64).
+#
+# Produces the same binary that was built locally with the ImmortalWrt SDK:
+# aarch64 musl, only needs the router's libstdc++/libgcc_s/libc, OpenSSL
+# statically linked (so the router's own OpenSSL 3.0 is irrelevant).
+# The stock build.yml only produces Ubuntu glibc binaries, which do not run
+# on the router.
+#
+# Router this targets: ImmortalWrt SNAPSHOT r43942, mediatek/filogic,
+# MT7986A (aarch64_cortex-a53). A second router (ipq6000) is NOT covered;
+# add it as a second matrix entry with its own SDK when needed.
+#
+# NOTE: the snapshot SDK is rolling. This workflow pins the tarball that
+# exists today. If the download 404s, look at
+# https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic/
+# and update SDK_FILE (and SDK_TOOLCHAIN_DIR if gcc changed) below.
+# A newer snapshot SDK still builds a userland binary that runs on r43942.
+
+name: Build CrossDesk Server (OpenWrt)
+
+on:
+  push:
+    branches: ["custom-id"]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SDK_BASE_URL: https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic
+  SDK_FILE: immortalwrt-sdk-mediatek-filogic_gcc-14.4.0_musl.Linux-x86_64.tar.zst
+  SDK_DIR: immortalwrt-sdk-mediatek-filogic_gcc-14.4.0_musl.Linux-x86_64
+  SDK_TOOLCHAIN_DIR: staging_dir/toolchain-aarch64_cortex-a53_gcc-14.4.0_musl
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-openwrt:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gnupg \
+            software-properties-common \
+            git \
+            curl \
+            unzip \
+            zstd \
+            build-essential \
+            binutils-aarch64-linux-gnu \
+            file
+
+      - name: Install xmake
+        shell: bash
+        run: |
+          sudo add-apt-repository -y ppa:xmake-io/xmake
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xmake
+
+      # Local builds needed this: tar fails restoring uid-1000 ownership
+      # when run as root in a user namespace. Harmless on the runner, and
+      # it protects the SDK extraction if the job ever runs as root.
+      - name: Force tar --no-same-owner
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec /usr/bin/tar --no-same-owner "$@"\n' > "$HOME/.local/bin/tar"
+          chmod +x "$HOME/.local/bin/tar"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download ImmortalWrt SDK
+        shell: bash
+        run: |
+          curl -fSL --retry 3 --retry-all-errors \
+            "${SDK_BASE_URL}/${SDK_FILE}" -o sdk.tar.zst
+          ls -lh sdk.tar.zst
+
+      - name: Extract SDK
+        shell: bash
+        run: |
+          tar --zstd -xf sdk.tar.zst
+          test -d "${SDK_DIR}/${SDK_TOOLCHAIN_DIR}/bin"
+
+      - name: Cross-compile crossdesk_server (musl, arm64)
+        shell: bash
+        run: |
+          xmake f -p cross -a arm64 \
+            --sdk="$PWD/${SDK_DIR}/${SDK_TOOLCHAIN_DIR}" \
+            --cross=aarch64-openwrt-linux-musl- \
+            -m release -y
+          xmake b -vy crossdesk_server
+          BINARY_PATH="$(find build -type f -path '*/release/crossdesk_server' | head -n 1)"
+          test -n "${BINARY_PATH}"
+          mkdir -p dist
+          cp "${BINARY_PATH}" ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64
+
+      - name: Verify router binary
+        shell: bash
+        run: |
+          file ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64
+          readelf -h ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64 | grep -i machine
+          echo "--- NEEDED libraries (must be only the router's own libs):"
+          readelf -d ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64 | grep NEEDED
+          # Must be aarch64 and must not link glibc-only libs.
+          file ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64 | grep -q "ARM aarch64"
+          test "$(readelf -d ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64 | grep -c NEEDED)" -le 3
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: crossdesk_server-openwrt-mediatek-filogic-arm64
+          path: ./dist/crossdesk_server-openwrt-mediatek-filogic-arm64
+          compression-level: 0
